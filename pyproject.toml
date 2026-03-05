@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.15"
 numpy = "^1.26.3"
 pillow = "^10.3.0"
 tqdm = "^4.66.1"
@@ -16,11 +16,19 @@ shapely = "^2.0.2"
 wandb = "^0.16.2"
 pylev = "^1.4.0"
 onnx = "^1.16.0"
+torch = {version = "^2.5.1", source = "pytorch-cuda"}
+torchvision = {version = "^0.20.1", source = "pytorch-cuda"}
+torchaudio = {version = "^2.5.1", source = "pytorch-cuda"}
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.8.0"
 types-Pillow = "^10.2.0.20240125"
 ruff = "^0.2.1"
+
+[[tool.poetry.source]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "explicit"
 
 [build-system]
 requires = ["poetry-core"]

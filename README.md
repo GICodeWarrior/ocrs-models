@@ -35,3 +35,18 @@ Face](https://huggingface.co/robertknight/ocrs) as PyTorch checkpoints,
 
 See the [Training guide](docs/training.md) for a walk-through of the process to
 train models from scratch or fine-tune existing models.
+
+## Custom font finetuning
+
+poetry run python -m ocrs_models.train_rec synthetic_font . --font-ttf <fontpath> --checkpoint text-rec-checkpoint-s52qdbqt.pt --batch-size 2048 --max-epochs 5 --finetune --lr 3e-4
+TORCH_LOGS=recompiles poetry run python -m ocrs_models.train_rec synthetic_font . --font-ttf ~/foxhole/Renner-Book.ttf --checkpoint text-rec-checkpoint-s52qdbqt.pt --batch-size 1024 --max-epochs 5 --finetune --lr 3e-4 --compile --tf32
+
+poetry run python -m ocrs_models.train_rec synthetic_font .   --font-ttf ~/foxhole/Renner-Book.ttf   --checkpoint text-rec-checkpoint.pt   --export text-rec-finetuned-2.onnx
+
+rten-convert text-rec-finetuned-2.onnx text-rec-finetuned-2.rten
+
+ocrs --rec-model text-rec-finetuned-2.rten <image>
+
+
+TORCH_LOGS=recompiles poetry run python -m ocrs_models.train_rec synthetic_font . --font-ttf ~/foxhole/Renner-Book.ttf --checkpoint text-rec-checkpoint-s52qdbqt.pt --batch-size 1024 --max-epochs 5 --finetune --lr 1e-5 --compile --tf32
+poetry run python -m ocrs_models.train_rec synthetic_font .   --font-ttf ~/foxhole/Renner-Book.ttf   --checkpoint text-rec-checkpoint.pt   --export text-rec-finetuned-5.onnx

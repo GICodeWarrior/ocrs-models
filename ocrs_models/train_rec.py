@@ -1,6 +1,7 @@
 from argparse import ArgumentParser, BooleanOptionalAction
 import math
 import os
+from typing import Optional
 
 from pylev import levenshtein
 import torch
@@ -11,10 +12,15 @@ from tqdm import tqdm
 import wandb
 
 from .datasets.hiertext import DEFAULT_ALPHABET, HierTextRecognition
+from .datasets.synth_font import SynthFontConfig, SyntheticFontRecognition
 from .datasets.util import ctc_greedy_decode_text, decode_text
 from .datasets import text_recognition_data_augmentations
 from .models import RecognitionModel
 from .train_detection import load_checkpoint, save_checkpoint
+
+
+def unwrap_model(model):
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
 class RecognitionAccuracyStats:
@@ -88,48 +94,45 @@ def train(
     dataloader: DataLoader,
     model: RecognitionModel,
     optimizer: torch.optim.Optimizer,
-) -> tuple[float, RecognitionAccuracyStats]:
-    """
-    Run one epoch of training.
-
-    Returns the mean loss and accuracy statistics.
-    """
+    *,
+    compute_metrics: bool = False,
+    preview: bool = False,
+) -> tuple[float, Optional[RecognitionAccuracyStats]]:
     model.train()
 
     train_iterable = tqdm(dataloader)
     train_iterable.set_description(f"Training (epoch {epoch})")
     mean_loss = 0.0
-    stats = RecognitionAccuracyStats()
+    stats = RecognitionAccuracyStats() if compute_metrics else None
 
     loss = CTCLoss()
     total_grad_norm = 0.0
 
     for batch_idx, batch in enumerate(train_iterable):
-        # nb. Divide input_lengths by 4 to match the downsampling that the
-        # model's CNN does.
         input_lengths = batch["image_width"].div(4, rounding_mode="floor")
-        img = batch["image"].to(device)
-
-        text_seq = batch["text_seq"].to(device)
+        img = batch["image"].to(device, non_blocking=True)
+        text_seq = batch["text_seq"].to(device, non_blocking=True)
         target_lengths = batch["text_len"]
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            # Predict [seq, batch, class] from [batch, 1, height, width].
             pred_seq = model(img)
             batch_loss = loss(pred_seq, text_seq, input_lengths, target_lengths)
 
-        stats.update(text_seq, target_lengths, pred_seq, input_lengths)
+        # EXPENSIVE: decode + levenshtein. Disable by default.
+        if stats is not None:
+            stats.update(text_seq, target_lengths, pred_seq, input_lengths)
 
-        # Preview decoded text for first batch in the dataset.
-        if batch_idx == 0:
+        # EXPENSIVE: prints decode preview. Disable by default.
+        if preview and batch_idx == 0:
+            alphabet_chars = list(DEFAULT_ALPHABET)
             for i in range(min(10, len(text_seq))):
                 y = text_seq[i]
                 x = pred_seq[:, i, :].argmax(-1)
                 x_len = input_lengths[i]
-                target_text = decode_text(y, list(DEFAULT_ALPHABET))
-                pred_text = ctc_greedy_decode_text(x[:x_len], list(DEFAULT_ALPHABET))
+                target_text = decode_text(y, alphabet_chars)
+                pred_text = ctc_greedy_decode_text(x[:x_len], alphabet_chars)
                 print(f'Sample train prediction "{pred_text}" target "{target_text}"')
 
         if math.isnan(batch_loss.item()):
@@ -138,18 +141,10 @@ def train(
             )
 
         batch_loss.backward()
-
-        # Clip to prevent exploding gradients.
-        #
-        # See https://discuss.pytorch.org/t/proper-way-to-do-gradient-clipping/191.
-        #
-        # `max_norm` value was taken from observing typical mean norms of
-        # "healthy" minibatches.
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=4.0)
         total_grad_norm += grad_norm.item()
 
         optimizer.step()
-
         mean_loss += batch_loss.item()
 
     mean_grad_norm = total_grad_norm / len(train_iterable)
@@ -265,8 +260,10 @@ def collate_samples(samples: list[dict]) -> dict:
     # sizes has been observed to lead to memory fragmentation and ultimately
     # memory exhaustion when training on GPUs.
     img_width_step = 256
+    min_img_width = 512
+
     max_img_width = max(image_width(s) for s in samples)
-    max_img_width = round_up(max_img_width, img_width_step)
+    max_img_width = max(min_img_width, round_up(max_img_width, img_width_step))
 
     max_text_len = max(text_len(s) for s in samples)
     max_text_len = round_up(max_text_len, img_width_step // downsample_factor)
@@ -292,7 +289,7 @@ def collate_samples(samples: list[dict]) -> dict:
             value=text_pad_value,
         )
 
-        image_pad_value = 0.0  # Grey, since image values are in [-0.5, 0.5]
+        image_pad_value = 0.0625
         sample["image_width"] = image_width(sample)
         sample["image"] = F.pad(
             sample["image"],
@@ -306,8 +303,11 @@ def collate_samples(samples: list[dict]) -> dict:
 
 def main():
     parser = ArgumentParser(description="Train text recognition model.")
-    parser.add_argument("dataset_type", type=str, choices=["hiertext"])
-    parser.add_argument("data_dir")
+    parser.add_argument("dataset_type", type=str, choices=["hiertext", "synthetic_font"])
+    parser.add_argument("data_dir", help="For hiertext only")
+
+    parser.add_argument("--font-ttf", type=str, help="Path to .ttf (required for synthetic_font)")
+
     parser.add_argument(
         "--augment",
         default=True,
@@ -316,6 +316,13 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--checkpoint", type=str, help="Model checkpoint to load")
+
+    parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help="Load checkpoint weights but reset optimizer/scheduler/epoch (do not resume).",
+    )
+
     parser.add_argument("--export", type=str, help="Export model to ONNX format")
     parser.add_argument("--lr", type=float, help="Initial learning rate")
     parser.add_argument(
@@ -329,14 +336,59 @@ def main():
         action="store_true",
         help="Run validation on an exiting model",
     )
+    parser.add_argument(
+        "--train-metrics",
+        default=False,
+        action=BooleanOptionalAction,
+        help="Compute expensive training metrics (CTC decode + Levenshtein). Off by default.",
+    )
+    parser.add_argument(
+        "--train-preview",
+        default=False,
+        action=BooleanOptionalAction,
+        help="Print decoded prediction preview for first training batch. Off by default.",
+    )
+    parser.add_argument(
+        "--compile",
+        default=False,
+        action=BooleanOptionalAction,
+        help="Enable torch.compile for the model (PyTorch 2.x).",
+    )
+    parser.add_argument(
+        "--tf32",
+        default=True,
+        action=BooleanOptionalAction,
+        help="Enable TF32 on matmul/cuDNN (recommended on Ampere/Ada).",
+    )
     args = parser.parse_args()
 
     # Set to aid debugging of initial text recognition model
     pytorch_seed = 1234
     torch.manual_seed(pytorch_seed)
 
+    if args.tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Preferred knob in recent PyTorch to allow TF32 where appropriate
+        torch.set_float32_matmul_precision("high")
+
     if args.dataset_type == "hiertext":
         load_dataset = HierTextRecognition
+    elif args.dataset_type == "synthetic_font":
+      if not args.font_ttf:
+          parser.error("--font-ttf is required when dataset_type=synthetic_font")
+
+      cfg = SynthFontConfig(
+          ttf_path=args.font_ttf,
+      )
+
+      def load_dataset(root_dir, train=True, max_images=None, transform=None):
+          return SyntheticFontRecognition(
+              config=cfg,
+              train=train,
+              max_images=max_images,
+              transform=transform,
+          )
     else:
         raise Exception(f"Unknown dataset type {args.dataset_type}")
 
@@ -344,7 +396,7 @@ def main():
     if max_images:
         validation_max_images = max(10, int(max_images * 0.1))
     else:
-        validation_max_images = None
+        validation_max_images = 4096
 
     if args.augment:
         augmentations = text_recognition_data_augmentations()
@@ -359,8 +411,11 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_samples,
-        num_workers=2,
         pin_memory=True,
+        num_workers=16,
+        persistent_workers=True,
+        prefetch_factor=4,
+        drop_last=True,
     )
 
     val_dataset = load_dataset(
@@ -371,14 +426,16 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_samples,
-        num_workers=2,
         pin_memory=True,
+        num_workers=16,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = RecognitionModel(alphabet=DEFAULT_ALPHABET).to(device)
 
-    initial_lr = args.lr or 1e-3  # 1e-3 is the Adam default
+    initial_lr = args.lr or 1e-3
     optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.1, patience=3
@@ -390,13 +447,32 @@ def main():
     epoch = 0
 
     if args.checkpoint:
-        checkpoint = load_checkpoint(args.checkpoint, model, optimizer, device)
-        epoch = checkpoint["epoch"]
+        if args.finetune:
+            # Fine-tune: load only model weights. Do NOT load optimizer state or epoch.
+            ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+            model.load_state_dict(ckpt["model_state"])
+
+            # Reset optimizer + scheduler (fresh LR and LR schedule).
+            optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, factor=0.1, patience=3
+            )
+            epoch = 0
+            print("Loaded model weights for fine-tuning (optimizer/epoch reset).")
+        else:
+            # Resume training: restore model + optimizer state + epoch.
+            checkpoint = load_checkpoint(args.checkpoint, model, optimizer, device)
+            epoch = checkpoint["epoch"]
+
+    train_model = model
+    if args.compile and device.type == "cuda":
+        #print(repr(torch._dynamo.list_backends()))
+        train_model = torch.compile(model)
 
     if args.export:
         test_batch = next(iter(val_dataloader))
         torch.onnx.export(
-            model,
+            unwrap_model(model),
             test_batch["image"].to(device),
             args.export,
             input_names=["line_image"],
@@ -431,14 +507,25 @@ def main():
 
     while args.max_epochs is None or epoch < args.max_epochs:
         train_loss, train_stats = train(
-            epoch, device, train_dataloader, model, optimizer
+            epoch,
+            device,
+            train_dataloader,
+            train_model,
+            optimizer,
+            compute_metrics=args.train_metrics,
+            preview=args.train_preview,
         )
 
-        print(
-            f"Epoch {epoch} train loss {train_loss} char error rate {train_stats.char_error_rate()}"
-        )
+        if train_stats is not None:
+            print(
+                f"Epoch {epoch} train loss {train_loss} char error rate {train_stats.char_error_rate()}"
+            )
+        else:
+            print(f"Epoch {epoch} train loss {train_loss}")
 
-        val_loss, val_stats = test(device, val_dataloader, model)
+        torch.cuda.empty_cache()
+        with torch.inference_mode():
+            val_loss, val_stats = test(device, val_dataloader, model)
         print(
             f"Epoch {epoch} validation loss {val_loss} char error rate {val_stats.char_error_rate()}"
         )
@@ -448,18 +535,19 @@ def main():
         print(f"Current learning rate {scheduler.get_last_lr()}")
 
         if enable_wandb:
-            wandb.log(
-                {
-                    "train_loss": train_loss,
-                    "train_accuracy": train_stats.stats_dict(),
-                    "val_loss": val_loss,
-                    "val_accuracy": val_stats.stats_dict(),
-                }
-            )
+            log_dict = {
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_accuracy": val_stats.stats_dict(),
+            }
+            if train_stats is not None:
+                log_dict["train_accuracy"] = train_stats.stats_dict()
+            wandb.log(log_dict)
 
-        save_checkpoint("text-rec-checkpoint.pt", model, optimizer, epoch=epoch)
+        save_checkpoint("text-rec-checkpoint.pt", unwrap_model(model), optimizer, epoch=epoch)
 
         epoch += 1
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
